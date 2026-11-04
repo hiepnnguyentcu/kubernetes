@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,6 +43,7 @@ import (
 	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/metadata/fake"
 	"k8s.io/client-go/rest"
+	clientgotesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/ktesting"
 )
@@ -222,6 +224,16 @@ func TestMetadataSharedInformerFactory(t *testing.T) {
 				objs = append(objs, ts.existingObj)
 			}
 			fakeClient := fake.NewSimpleMetadataClient(scheme, objs...)
+			// The fake tracker does not replay deletes to watchers that
+			// register afterwards, so a trigger issued after cache sync but
+			// before the informer's watch is established would be lost.
+			// Wait for the watch to be established before triggering.
+			watchStarted := make(chan struct{})
+			var watchStartedOnce sync.Once
+			fakeClient.PrependWatchReactor("*", func(clientgotesting.Action) (bool, watch.Interface, error) {
+				watchStartedOnce.Do(func() { close(watchStarted) })
+				return false, nil, nil
+			})
 			target := NewSharedInformerFactory(fakeClient, 0)
 
 			// act
@@ -231,6 +243,11 @@ func TestMetadataSharedInformerFactory(t *testing.T) {
 			target.StartWithContext(tCtx)
 			if result := target.WaitForCacheSyncWithContext(tCtx); result.Err != nil || !result.Synced[ts.gvr] {
 				t.Fatalf("informer for %s hasn't synced: %v", ts.gvr, result.Err)
+			}
+			select {
+			case <-watchStarted:
+			case <-tCtx.Done():
+				t.Fatalf("informer watch was not established")
 			}
 
 			testObject := ts.trigger(tCtx, ts.gvr, ts.ns, fakeClient, ts.existingObj)
